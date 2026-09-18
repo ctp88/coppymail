@@ -1,0 +1,320 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, minimum-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover"/>
+  <title>Quản lý Email Online - Giữ Nguyên</title>
+  <script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-app-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-database-compat.js"></script>
+  <style>
+    /* 🔒 Khóa zoom: chặn pinch-zoom, double-tap zoom và tự động phóng chữ */
+    html {
+      -webkit-text-size-adjust: 100%;
+      text-size-adjust: 100%;
+      touch-action: pan-x pan-y;
+    }
+    html, body {
+      touch-action: pan-x pan-y;
+      overscroll-behavior: none;
+    }
+    button, input, textarea, a {
+      touch-action: manipulation; /* chặn double-tap zoom nhưng vẫn bấm nhanh được */
+    }
+    body {
+      font-family: sans-serif;
+      background: #9e9e9e; /* xám mặc định */
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 20px;
+      transition: background 0.5s, color 0.5s;
+      color: initial;
+    }
+    body.success-mode {
+      background: #3cc398 !important;
+      color: white !important;
+    }
+    textarea, input, button {
+      font-size: 16px;
+      width: 90%;
+      max-width: 340px;
+      margin-top: 10px;
+      padding: 12px;
+      border-radius: 6px;
+      border: 1px solid #ccc;
+      box-sizing: border-box;
+    }
+    button {
+      background: #007bff;
+      color: white;
+      border: none;
+      cursor: pointer;
+      transition: background 0.3s;
+    }
+    button:hover { background: #0056b3; }
+    .input-container {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      width: 90%;
+      max-width: 340px;
+      margin-top: 10px;
+    }
+    #manualCopyButton { max-width: 60px; padding: 10px; }
+    #deleteCurrentButton { background: #dc3545; }
+    #deleteCurrentButton:hover { background: #a71d2a; }
+    #copyButton {
+      font-size: 20px;
+      padding: 18px;
+      width: 95%;
+      max-width: 380px;
+      margin-top: 10px;
+      background: #28a745;
+    }
+    #copyButton:hover { background: #1c7c31; }
+    #switchMailButton {
+      background: #ffc107;
+      color: black;
+      width: 95%;
+      max-width: 380px;
+      margin-top: 10px;
+      padding: 12px;
+    }
+    #switchMailButton:hover { background: #e0a800; }
+    #customToast {
+      position: fixed;
+      top: -100px;
+      left: 0;
+      width: 100%;
+      background-color: #343a40;
+      color: white;
+      text-align: center;
+      padding: 16px 10px;
+      font-size: 18px;
+      font-weight: bold;
+      box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+      z-index: 9999;
+      transition: top 0.5s ease-in-out;
+    }
+    #customToast.show { top: 0; }
+    #customToast.error { background-color: #d93025; }
+    #customToast.success { background-color: #28a745; }
+  </style>
+</head>
+<body>
+<div id="customToast"></div>
+
+<h3 style="text-align: center; line-height: 1.4;">
+  📨 Quản lý danh sách Email 
+  <span id="switchPage" style="color:#007bff;text-decoration:underline;cursor:pointer;">Online</span><br>
+  (🔥🔥🔥 US 🔥🔥🔥)
+</h3>
+
+<textarea id="emailListInput" placeholder="Dán email, text rác, phân cách bất kỳ (| ; , space ...)"></textarea>
+<button id="addListButton">➕ Thêm Mail 🔥 Vào Danh Sách</button>
+<button id="deleteCurrentButton">🗑️ Xóa Mail Hiện Tại 🔥</button>
+
+<div class="input-container">
+  <input type="text" id="emailOutput" placeholder="Email sẽ xuất hiện ở đây" readonly>
+  <button id="manualCopyButton">📋</button>
+</div>
+
+<p id="count"></p>
+<button id="switchMailButton">🔄 Đổi Mail</button>
+<button id="copyButton">📋 Lấy & Copy Email</button>
+
+<p id="output"></p>
+
+<script>
+const firebaseConfig = {
+  apiKey: "AIzaSyBdit5HoqvJZXsFGbKH36R1N6AeZb1lg_c",
+  authDomain: "trang2linh-bb2cf.firebaseapp.com",
+  databaseURL: "https://trang2linh-bb2cf-default-rtdb.firebaseio.com",
+  projectId: "trang2linh-bb2cf",
+  storageBucket: "trang2linh-bb2cf.firebasestorage.app",
+  messagingSenderId: "902331513231",
+  appId: "1:902331513231:web:66af57da162ac2109bb3fa"
+};
+firebase.initializeApp(firebaseConfig);
+const db = firebase.database();
+const emailRef = db.ref('emails');
+const currentIndexRef = db.ref('currentIndex');
+
+let emailList = [];
+let currentIndex = 0;
+
+// ======== Tiện ích ========
+function extractEmails(text) {
+  const parts = text.split(/[\s,;|]+/);
+  const itemSet = new Set();
+
+  parts.forEach(item => {
+    const cleaned = item.trim();
+    if (cleaned !== '') {
+      itemSet.add(cleaned);
+    }
+  });
+
+  return Array.from(itemSet);
+}
+
+function updateCount() {
+  document.getElementById('count').textContent = `📊 Tổng số email: ${emailList.length}`;
+}
+
+function showToast(msg, type="info", duration=4000) {
+  const toast = document.getElementById('customToast');
+  toast.textContent = msg;
+  toast.className = '';
+  toast.classList.add('show');
+  if (type === "error") toast.classList.add('error');
+  else if (type === "success") toast.classList.add('success');
+  setTimeout(() => toast.classList.remove('show'), duration);
+}
+
+function resetBody() {
+  document.body.classList.remove('success-mode');
+}
+
+function copyText(text) {
+  if (navigator.clipboard && window.isSecureContext) {
+    navigator.clipboard.writeText(text);
+  } else {
+    const textarea = document.createElement("textarea");
+    textarea.value = text;
+    textarea.style.position = "fixed";
+    textarea.style.left = "-9999px";
+    document.body.appendChild(textarea);
+    textarea.focus();
+    textarea.select();
+    document.execCommand('copy');
+    document.body.removeChild(textarea);
+  }
+}
+
+// ======== Firebase Sync ========
+emailRef.on('value', snapshot => {
+  const data = snapshot.val();
+  emailList = data ? data : [];
+  updateCount();
+  showCurrentEmail();
+});
+
+currentIndexRef.on('value', snapshot => {
+  const val = snapshot.val();
+  currentIndex = val || 0;
+  showCurrentEmail();
+});
+
+// ======== Hiển thị Email ========
+function showCurrentEmail() {
+  if (emailList.length === 0) {
+    document.getElementById('emailOutput').value = '';
+    return;
+  }
+  const index = currentIndex % emailList.length;
+  const email = emailList[index];
+  document.getElementById('emailOutput').value = `${index + 1}. ${email}`;
+}
+
+// ======== Thêm Email ========
+document.getElementById('addListButton').addEventListener('click', () => {
+  const input = document.getElementById('emailListInput').value.trim();
+  const newEmails = extractEmails(input);
+  if (newEmails.length === 0) return showToast('⚠️ Không có email hợp lệ.', "error");
+  
+  emailRef.transaction(current => {
+    const list = current || [];
+    newEmails.forEach(e => { if (!list.includes(e)) list.push(e); });
+    return list;
+  }, (err, committed) => {
+    if (err || !committed) showToast('⚠️ Lỗi thêm mail.', "error");
+    else showToast(`✅ Đã thêm ${newEmails.length} mail.`, "success");
+    document.getElementById('emailListInput').value = '';
+  });
+});
+
+// ======== Xóa Mail Hiện Tại ========
+document.getElementById('deleteCurrentButton').addEventListener('click', () => {
+  if (emailList.length === 0) return showToast('⚠️ Danh sách rỗng.', "error");
+
+  const currentMail = emailList[currentIndex];
+  if (!confirm(`Bạn chắc chắn muốn xóa mail này?\n${currentMail}`)) return;
+
+  emailRef.transaction(current => {
+    if (!current) return [];
+    current.splice(currentIndex, 1);
+    return current;
+  }, (err, committed) => {
+    if (err || !committed) return showToast('⚠️ Lỗi khi xóa mail.', "error");
+    showToast('🗑️ Đã xóa mail hiện tại.', "success");
+    if (currentIndex >= emailList.length - 1) currentIndex = 0;
+    currentIndexRef.set(currentIndex);
+  });
+});
+
+// ======== Copy Email ========
+function handleCopy() {
+  const val = document.getElementById('emailOutput').value;
+  if (!val) return showToast('⚠️ Không có mail để copy.', "error");
+  const email = val.replace(/^\d+\.\s*/, '');
+  copyText(email);
+  document.body.classList.add('success-mode');
+  showToast(`📋 Đã copy: ${email}`, "success");
+  setTimeout(resetBody, 10000); // 🔵 Xanh trong 10 giây
+}
+
+document.getElementById('manualCopyButton').addEventListener('click', handleCopy);
+document.getElementById('copyButton').addEventListener('click', handleCopy);
+
+// ======== Đổi Mail ========
+document.getElementById('switchMailButton').addEventListener('click', () => {
+  if (emailList.length === 0) return showToast('⚠️ Danh sách rỗng.', "error");
+  currentIndex = (currentIndex + 1) % emailList.length;
+  currentIndexRef.set(currentIndex);
+  showToast('🔄 Đã chuyển sang mail tiếp theo.', "success");
+});
+
+// ======== Chuyển trang ========
+document.getElementById("switchPage").addEventListener("click", () => {
+  window.location.href = "index.html";
+});
+</script>
+<script>
+// 🔒 Khóa zoom trên mọi thiết bị (pinch, double-tap, Ctrl + cuộn, Ctrl +/-/0)
+(function () {
+  // Safari iOS: chặn cử chỉ pinch-zoom
+  ['gesturestart', 'gesturechange', 'gestureend'].forEach(function (evt) {
+    document.addEventListener(evt, function (e) { e.preventDefault(); }, { passive: false });
+  });
+
+  // Chặn pinch-zoom bằng nhiều ngón trên màn hình cảm ứng
+  document.addEventListener('touchmove', function (e) {
+    if (e.touches.length > 1) e.preventDefault();
+  }, { passive: false });
+
+  // Chặn double-tap zoom (bỏ qua nút/ô nhập để không chặn thao tác bấm nhanh)
+  var lastTouchEnd = 0;
+  document.addEventListener('touchend', function (e) {
+    var now = Date.now();
+    var el = e.target.closest ? e.target.closest('button, input, textarea, a, [contenteditable]') : null;
+    if (!el && now - lastTouchEnd <= 300) e.preventDefault();
+    lastTouchEnd = now;
+  }, { passive: false });
+
+  // Chặn zoom bằng Ctrl/Cmd + cuộn chuột
+  document.addEventListener('wheel', function (e) {
+    if (e.ctrlKey || e.metaKey) e.preventDefault();
+  }, { passive: false });
+
+  // Chặn zoom bằng bàn phím: Ctrl/Cmd với + - 0
+  document.addEventListener('keydown', function (e) {
+    if ((e.ctrlKey || e.metaKey) &&
+        ['+', '-', '=', '_', '0'].indexOf(e.key) !== -1) {
+      e.preventDefault();
+    }
+  }, { passive: false });
+})();
+</script>
+</body>
+</html>
