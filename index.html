@@ -2,11 +2,24 @@
 <html lang="vi">
 <head>
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, minimum-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover"/>
   <title>Quản lý Email Online - Auto Filter</title>
   <script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-app-compat.js"></script>
   <script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-database-compat.js"></script>
   <style>
+    /* 🔒 Khóa zoom: chặn pinch-zoom, double-tap zoom và tự động phóng chữ */
+    html {
+      -webkit-text-size-adjust: 100%;
+      text-size-adjust: 100%;
+      touch-action: pan-x pan-y;
+    }
+    html, body {
+      touch-action: pan-x pan-y;
+      overscroll-behavior: none;
+    }
+    button, input, textarea, a {
+      touch-action: manipulation; /* chặn double-tap zoom nhưng vẫn bấm nhanh được */
+    }
     body {
       font-family: sans-serif;
       background: #f0f2f5;
@@ -21,8 +34,12 @@
       background: #fff3cd !important;
     }
     body.duplicate-mode {
-      background: #8b0000 !important; /* đỏ đậm hơn */
-      color: black !important;
+      background: #d93025 !important; /* đỏ toàn phông khi email bị lấy bởi thiết bị khác */
+      color: white !important;
+    }
+    body.success-mode {
+      background: #3cc398 !important; /* xanh custom khi copy thành công */
+      color: white !important;
     }
     textarea, input, button {
       font-size: 16px;
@@ -76,9 +93,11 @@
     #clearLogsButton {
       background: #ffc107;
       color: black;
-    }
-    #clearLogsButton:hover {
-      background: #e0a800;
+      width: 95%; /* chiều ngang bằng copyButton */
+      max-width: 380px;
+      margin-top: 10px;
+      padding: 12px; /* vẫn giữ nguyên chiều cao */
+      cursor: default; /* không còn là nút bấm, chỉ hiển thị số liệu */
     }
     #customToast {
       position: fixed;
@@ -102,7 +121,7 @@
       background-color: #d93025;
     }
     #customToast.success {
-      background-color: #28a745;
+      background-color: #28a745; /* xanh lá cho copy, thêm, clearlog, xoá email */
     }
     #customToast.warning {
       background-color: #f9c851;
@@ -127,11 +146,10 @@
 <body>
 <div id="customToast"></div>
 
-<h3>
-  📨 <a href="https://ctp88.github.io/webmaill-/" target="_blank" rel="noopener noreferrer">
-    Quản lý danh sách Email Online
-  </a><br>
-  Design by Bảo
+<h3 style="text-align: center; line-height: 1.4;">
+  📨 Quản lý danh sách Email 
+  <span id="switchPage" style="color:#007bff;text-decoration:underline;cursor:pointer;">Online</span><br>
+  (Tự Lọc & Lưu)
 </h3>
 
 <textarea id="emailListInput" placeholder="Dán email, text rác, phân cách bất kỳ (| ; , space ...)"></textarea>
@@ -144,7 +162,7 @@
 </div>
 
 <p id="count"></p>
-<button id="clearLogsButton">🧹 Clear Log Copy</button>
+<button id="clearLogsButton">🗓️ Số Lượng Hôm Nay: 0</button>
 
 <button id="copyButton">📋 Lấy & Copy Email</button>
 <p id="output"></p>
@@ -164,8 +182,9 @@ const db = firebase.database();
 const emailRef = db.ref('emails');
 const lastCopiedRef = db.ref('lastCopied');
 const copyLogsRef = db.ref('copyLogs');
+const dailyAddCountRef = db.ref('dailyAddCount');
 
-let emailList = [];
+let emailMap = {}; // { key: email } — mỗi mail là 1 node riêng để giành atomic, chống trùng khi nhiều máy bấm cùng lúc
 let isDuplicateToast = false;
 
 let deviceId = localStorage.getItem('deviceId');
@@ -189,8 +208,96 @@ function extractEmails(text) {
 }
 
 function updateCount() {
-  document.getElementById('count').textContent = `📊 Số email còn lại: ${emailList.length}`;
+  document.getElementById('count').textContent = `📊 Số email còn lại: ${Object.keys(emailMap).length}`;
 }
+
+// Chuyển đổi 1 lần dữ liệu cũ (mảng) sang dạng map { key: email } để giành mail
+// theo từng node riêng biệt — atomic, không còn tranh chấp trên 1 node duy nhất.
+function migrateAndListen() {
+  emailRef.transaction(current => {
+    if (Array.isArray(current)) {
+      const map = {};
+      current.forEach(email => {
+        if (email) {
+          const key = emailRef.push().key;
+          map[key] = email;
+        }
+      });
+      return map;
+    }
+    return current; // đã là map (hoặc rỗng) thì giữ nguyên
+  }, () => {
+    emailRef.on('value', snapshot => {
+      const data = snapshot.val();
+      emailMap = (data && typeof data === 'object' && !Array.isArray(data)) ? data : {};
+      updateCount();
+    });
+  });
+}
+
+function transactionAsync(ref, updater) {
+  return new Promise((resolve, reject) => {
+    ref.transaction(updater, (error, committed, snapshot) => {
+      if (error) reject(error);
+      else resolve({ committed, snapshot });
+    });
+  });
+}
+
+// Giành đúng 1 mail: mỗi mail là 1 node riêng nên transaction trên node đó
+// chỉ có đúng 1 client thắng, dù bao nhiêu máy cùng bấm 1 lúc.
+async function claimOneEmail() {
+  const triedKeys = new Set();
+  while (true) {
+    const availableKeys = Object.keys(emailMap).filter(k => !triedKeys.has(k));
+    if (availableKeys.length === 0) return null;
+    const key = availableKeys[Math.floor(Math.random() * availableKeys.length)];
+    triedKeys.add(key);
+
+    let claimedValue = null;
+    const { committed } = await transactionAsync(emailRef.child(key), cur => {
+      if (cur === null || cur === undefined) {
+        claimedValue = null;
+        return; // node đã bị máy khác giành trước — hủy, thử node khác
+      }
+      claimedValue = cur;
+      return null; // xóa node = giành được mail này
+    });
+
+    if (committed && claimedValue) {
+      return { key, email: claimedValue };
+    }
+  }
+}
+
+// "Ngày" tính theo giờ Việt Nam (UTC+7), reset lúc 3h sáng — không phụ thuộc
+// múi giờ đang cài trên từng điện thoại, để mọi máy thấy chung 1 số liệu.
+function getDailyKey() {
+  const VN_OFFSET_MS = 7 * 60 * 60 * 1000;
+  const RESET_HOUR_MS = 3 * 60 * 60 * 1000;
+  const shifted = new Date(Date.now() + VN_OFFSET_MS - RESET_HOUR_MS);
+  const y = shifted.getUTCFullYear();
+  const m = String(shifted.getUTCMonth() + 1).padStart(2, '0');
+  const d = String(shifted.getUTCDate()).padStart(2, '0');
+  return `${y}-${m}-${d}`;
+}
+
+let dailyAddCountListenerKey = null;
+function attachDailyAddCountListener() {
+  const key = getDailyKey();
+  if (key === dailyAddCountListenerKey) return; // đã gắn đúng ngày rồi
+  if (dailyAddCountListenerKey) {
+    dailyAddCountRef.child(dailyAddCountListenerKey).off('value');
+  }
+  dailyAddCountListenerKey = key;
+  dailyAddCountRef.child(key).on('value', snapshot => {
+    const count = snapshot.val() || 0;
+    document.getElementById('clearLogsButton').textContent = `🗓️ Số Lượng Hôm Nay: ${count}`;
+  });
+}
+attachDailyAddCountListener();
+// Kiểm tra mỗi phút để tự chuyển sang ngày mới lúc 3h sáng nếu trang vẫn đang mở
+setInterval(attachDailyAddCountListener, 60 * 1000);
 
 function showToast(msg, isError = false, isSuccess = false, isWarning = false, duration = 10000, persistent = false) {
   const toast = document.getElementById('customToast');
@@ -218,15 +325,28 @@ function hideToast() {
   isDuplicateToast = false;
 }
 
-function copyText(text) {
-  if (navigator.clipboard && window.isSecureContext) {
-    navigator.clipboard.writeText(text).then(() => {
-      showToast(`✅ Đã copy: ${text}`, false, true);
-    }).catch(() => fallbackCopy(text));
-  } else fallbackCopy(text);
+function resetBody() {
+  document.body.classList.remove('success-mode', 'duplicate-mode', 'warning-mode');
 }
 
-function fallbackCopy(text) {
+// opts.manualFallbackHint = true: dùng khi copy tự động chạy SAU một bước chờ
+// mạng (giành mail xong mới copy) — lúc đó Safari/iOS có thể đã hết hạn "cử chỉ
+// người dùng" nên chặn cả clipboard API lẫn execCommand. Trường hợp này báo rõ
+// email đã lấy được an toàn, chỉ cần bấm nút 📋 thủ công (một cú chạm mới) để
+// copy, thay vì báo lỗi đỏ gây hoang mang.
+// Trả về true/false đã copy thành công hay chưa, để nơi gọi biết chắc kết quả
+// thật thay vì đoán qua toast (tránh 2 toast bất đồng bộ đè lên nhau).
+function copyText(text, opts = {}) {
+  if (navigator.clipboard && window.isSecureContext) {
+    return navigator.clipboard.writeText(text).then(() => {
+      showToast(`📋 Đang copy: ${text}`);
+      return true;
+    }).catch(() => fallbackCopy(text, opts));
+  }
+  return Promise.resolve(fallbackCopy(text, opts));
+}
+
+function fallbackCopy(text, opts = {}) {
   const textarea = document.createElement("textarea");
   textarea.value = text;
   textarea.style.position = "fixed";
@@ -234,20 +354,31 @@ function fallbackCopy(text) {
   document.body.appendChild(textarea);
   textarea.focus();
   textarea.select();
+  let successful = false;
   try {
-    const successful = document.execCommand('copy');
-    showToast(successful ? `✅ Đã copy: ${text}` : '⚠️ Không thể copy.', !successful, successful);
+    successful = document.execCommand('copy');
+    if (successful) {
+      showToast(`📋 Đang copy: ${text}`, false, true);
+    } else if (opts.manualFallbackHint) {
+      // Safari/iOS có thể chặn copy tự động vì đã chờ mạng (giành mail) trước
+      // khi copy nên hết hạn "cử chỉ người dùng". Email vẫn lấy được an toàn,
+      // chỉ cần bấm nút 📋 (một cú chạm mới) là copy được.
+      showToast(`✅ Đã lấy: ${text} — Bấm nút 📋 để copy`, false, false, true);
+    } else {
+      showToast('⚠️ Không thể copy.', true);
+    }
   } catch {
-    showToast('⚠️ Lỗi khi copy.', true);
+    if (opts.manualFallbackHint) {
+      showToast(`✅ Đã lấy: ${text} — Bấm nút 📋 để copy`, false, false, true);
+    } else {
+      showToast('⚠️ Lỗi khi copy.', true);
+    }
   }
   document.body.removeChild(textarea);
+  return successful;
 }
 
-emailRef.on('value', snapshot => {
-  const data = snapshot.val();
-  emailList = data ? data : [];
-  updateCount();
-});
+migrateAndListen();
 
 document.getElementById('addListButton').addEventListener('click', () => {
   const input = document.getElementById('emailListInput').value.trim();
@@ -256,35 +387,44 @@ document.getElementById('addListButton').addEventListener('click', () => {
     showToast('⚠️ Không có email hợp lệ để thêm.', true);
     return;
   }
-  emailRef.transaction(currentList => {
-    const updatedList = currentList ? currentList.slice() : [];
+  let addedCount = 0;
+  emailRef.transaction(current => {
+    const map = (current && typeof current === 'object' && !Array.isArray(current)) ? Object.assign({}, current) : {};
+    const existing = new Set(Object.values(map));
+    addedCount = 0;
     filteredEmails.forEach(email => {
-      if (!updatedList.includes(email)) {
-        updatedList.push(email);
+      if (!existing.has(email)) {
+        const key = emailRef.push().key;
+        map[key] = email;
+        existing.add(email);
+        addedCount++;
       }
     });
-    return updatedList;
+    return map;
   }, (error, committed, snapshot) => {
     if (error || !committed) {
       showToast('⚠️ Không thể thêm email.', true);
     } else {
-      const updatedList = snapshot.val() ? snapshot.val() : [];
-      showToast(`✅ Đã thêm ${filteredEmails.length} email hợp lệ, tổng: ${updatedList.length}.`);
+      const updatedMap = snapshot.val() || {};
+      showToast(`✅ Đã thêm ${addedCount} email hợp lệ, tổng: ${Object.keys(updatedMap).length}.`, false, true);
       document.getElementById('emailListInput').value = '';
-      emailList = updatedList;
+      emailMap = updatedMap;
       updateCount();
+      if (addedCount > 0) {
+        dailyAddCountRef.child(getDailyKey()).transaction(cur => (cur || 0) + addedCount);
+      }
     }
   });
 });
 
 document.getElementById('deleteListButton').addEventListener('click', () => {
   if (!confirm("Bạn có chắc muốn xóa toàn bộ danh sách email?")) return;
-  emailRef.set([], (error) => {
+  emailRef.set(null, (error) => {
     if (error) {
       showToast('⚠️ Lỗi khi xóa danh sách.', true);
     } else {
-      showToast('✅ Đã xóa toàn bộ danh sách email.');
-      emailList = [];
+      showToast('✅ Đã xóa toàn bộ danh sách email.', false, true);
+      emailMap = {};
       updateCount();
     }
   });
@@ -315,82 +455,115 @@ function onCopyEmail(email) {
       }
     }
     if (trùng) {
-      document.body.classList.add('duplicate-mode');
+      resetBody();
+      document.body.classList.add('duplicate-mode'); // đỏ toàn phông
       showToast(`⚠️ Email "${email}" đã bị lấy trước đó bởi thiết bị khác!`, true, false, false, 0, true);
     }
   });
 }
 
 document.getElementById('copyButton').addEventListener('click', () => {
-  document.body.classList.remove('duplicate-mode');
+  resetBody();
   hideToast();
   const copyButton = document.getElementById('copyButton');
   copyButton.disabled = true;
   copyButton.textContent = "⏳ Đang xử lý...";
 
-  if (emailList.length === 0) {
-    showToast('⚠️ Danh sách đã hết email.', true);
-    copyButton.disabled = false;
-    copyButton.textContent = "📋 Lấy & Copy Email";
-    return;
+  const claimPromise = claimOneEmail();
+
+  // Mở lệnh ghi clipboard NGAY trong cử chỉ bấm (bắt buộc với Safari/iOS —
+  // clipboard chỉ được cấp quyền nếu lệnh write() gọi đồng bộ trong cú chạm).
+  // Dữ liệu thật (email) sẽ "rót" vào sau khi giành mail xong, qua Promise —
+  // Safari/Chrome hiện đại hỗ trợ ClipboardItem nhận dữ liệu tới muộn kiểu
+  // này mà vẫn tính là hành động hợp lệ trong cử chỉ người dùng. Nhờ vậy chỉ
+  // cần bấm đúng 1 lần, không cần bấm thêm nút 📋 thủ công.
+  let writePromise = null;
+  if (navigator.clipboard && window.isSecureContext && typeof ClipboardItem !== 'undefined') {
+    try {
+      const dataPromise = claimPromise.then(claimed => {
+        if (!claimed) throw new Error('no-email');
+        return new Blob([claimed.email], { type: 'text/plain' });
+      });
+      writePromise = navigator.clipboard.write([new ClipboardItem({ 'text/plain': dataPromise })]);
+      writePromise.catch(() => {}); // tránh cảnh báo unhandled rejection khi hết mail/không hỗ trợ
+    } catch (e) {
+      writePromise = null;
+    }
   }
 
-  const randomIndex = Math.floor(Math.random() * emailList.length);
-  const email = emailList[randomIndex];
-  copyText(email);
-
-  emailRef.transaction(currentList => {
-    if (!currentList) return null;
-    const idx = currentList.indexOf(email);
-    if (idx !== -1) {
-      currentList.splice(idx, 1);
+  claimPromise.then(async claimed => {
+    if (!claimed) {
+      showToast('⚠️ Danh sách đã hết email.', true);
+      return;
     }
-    return currentList;
-  }, (error, committed, snapshot) => {
-    if (error) {
-      showToast('⚠️ Lỗi khi xóa email.', true);
-    } else if (committed) {
-      document.getElementById('emailOutput').value = email;
-      emailList = snapshot.val() || [];
-      updateCount();
-      lastCopiedRef.set({ email, time: Date.now(), deviceId });
-      onCopyEmail(email);
-    }
-    copyButton.disabled = false;
-    copyButton.textContent = "📋 Lấy & Copy Email";
-  });
-});
+    const { email } = claimed;
+    document.getElementById('emailOutput').value = email;
+    lastCopiedRef.set({ email, time: Date.now(), deviceId });
 
-document.getElementById('clearLogsButton').addEventListener('click', () => {
-  copyLogsRef.set(null, (error) => {
-    if (error) {
-      showToast('⚠️ Lỗi khi xóa log copy.', true);
+    // ✅ Giành mail thành công là chắc chắn, đổi nền xanh ngay
+    resetBody();
+    document.body.classList.add('success-mode');
+
+    // Ưu tiên kết quả copy "đồng bộ với cử chỉ" ở trên; chỉ khi trình duyệt
+    // không hỗ trợ hoặc thất bại thật sự mới rơi xuống copyText (có thể cần
+    // bấm 📋 thủ công trên các trình duyệt không hỗ trợ cách trên).
+    let copied = writePromise ? await writePromise.then(() => true).catch(() => false) : false;
+    if (copied) {
+      showToast(`✅ Đã lấy & copy: ${email}`, false, true);
     } else {
-      showToast('✅ Đã xóa toàn bộ log copy.', false, true);
+      copied = await copyText(email, { manualFallbackHint: true });
+      if (copied) showToast(`✅ Đã lấy & copy: ${email}`, false, true);
     }
+
+    onCopyEmail(email);
+  }).catch(() => {
+    showToast('⚠️ Lỗi khi lấy email.', true);
+  }).finally(() => {
+    copyButton.disabled = false;
+    copyButton.textContent = "📋 Lấy & Copy Email";
   });
 });
-const TELEGRAM_TOKEN = "8059063840:AAFUTs7wn_tR9xlFEvnjJHW7K6bhcnmwh4U";
-const TELEGRAM_CHAT_ID = "6976397277";
 
-function sendTelegramAlert(message) {
-  fetch(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ chat_id: TELEGRAM_CHAT_ID, text: message })
+// ✅ thêm duy nhất chức năng bấm "Online" để chuyển sang trang2.html
+document.getElementById("switchPage").addEventListener("click", () => {
+  window.location.href = "trang2.html";
+});
+</script>
+<script>
+// 🔒 Khóa zoom trên mọi thiết bị (pinch, double-tap, Ctrl + cuộn, Ctrl +/-/0)
+(function () {
+  // Safari iOS: chặn cử chỉ pinch-zoom
+  ['gesturestart', 'gesturechange', 'gestureend'].forEach(function (evt) {
+    document.addEventListener(evt, function (e) { e.preventDefault(); }, { passive: false });
   });
-}
 
-function updateCount() {
-  document.getElementById('count').textContent = `📊 Số email còn lại: ${emailList.length}`;
+  // Chặn pinch-zoom bằng nhiều ngón trên màn hình cảm ứng
+  document.addEventListener('touchmove', function (e) {
+    if (e.touches.length > 1) e.preventDefault();
+  }, { passive: false });
 
-  if (emailList.length === 15 && !localStorage.getItem('hasSentTelegramAlert')) {
-    sendTelegramAlert(`⚠️ Danh sách email còn lại: ${emailList.length}. Hãy chuẩn bị thêm mới.`);
-    localStorage.setItem('hasSentTelegramAlert', 'true');
-  }
-}
+  // Chặn double-tap zoom (bỏ qua nút/ô nhập để không chặn thao tác bấm nhanh)
+  var lastTouchEnd = 0;
+  document.addEventListener('touchend', function (e) {
+    var now = Date.now();
+    var el = e.target.closest ? e.target.closest('button, input, textarea, a, [contenteditable]') : null;
+    if (!el && now - lastTouchEnd <= 300) e.preventDefault();
+    lastTouchEnd = now;
+  }, { passive: false });
+
+  // Chặn zoom bằng Ctrl/Cmd + cuộn chuột
+  document.addEventListener('wheel', function (e) {
+    if (e.ctrlKey || e.metaKey) e.preventDefault();
+  }, { passive: false });
+
+  // Chặn zoom bằng bàn phím: Ctrl/Cmd với + - 0
+  document.addEventListener('keydown', function (e) {
+    if ((e.ctrlKey || e.metaKey) &&
+        ['+', '-', '=', '_', '0'].indexOf(e.key) !== -1) {
+      e.preventDefault();
+    }
+  }, { passive: false });
+})();
 </script>
 </body>
 </html>
-
-
